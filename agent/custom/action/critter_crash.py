@@ -9,9 +9,10 @@ import numpy as np
 from maa.agent.agent_server import AgentServer
 from maa.context import Context
 from maa.custom_action import CustomAction
-from utils import logger
-from utils.maa_types import is_hit, ocr_text
+from utils.logger import logger
+from utils.maa_types import custom_result_dict, is_hit, ocr_text
 from utils.params import parse_params
+from utils.runtime_paths import get_runtime_paths
 
 # 翻斗棋策略表：棋子白名单、棋盘 ROI、奖励优先级、选领队卡位都收敛到这一个数据文件，
 # 换版本（3.5 鹿蜀成长流 → 4.0）只改 JSON，不动代码。
@@ -20,7 +21,12 @@ from utils.params import parse_params
 # 历史策略表（原以注释形式内联在本文件，现已迁出，留此备查）：
 #   - 3.2 工厂流：Knight(8级) + Cat1-4/Robot1-4/Item1-3 占位
 #   - 4.0 鹿蜀成长流：见 data/critter_crash/strategy-4.0.json（唯一策略表，运行时读盘）
-STRATEGY_PATH = Path("data/critter_crash/strategy-4.0.json")
+STRATEGY_REL_PATH = "data/critter_crash/strategy-4.0.json"
+
+
+def _default_strategy_path() -> Path:
+    """默认策略表按覆盖层解析：数据目录里的热更文件优先，包内基线兜底。"""
+    return get_runtime_paths().resolve(STRATEGY_REL_PATH)
 
 
 class StrategyError(ValueError):
@@ -70,7 +76,9 @@ DEFAULT_PANEL_CLOSE_POINT = (1150, 650)
 # 「每局只用一次」的节点：它们的 max_hit 是按**任务**计的，打几局就会耗尽，
 # 之后再也认不出来 → 必然死端。所以每局开始（回到对局页）时把命中计数清零。
 # 实测：第 3 局起 CCNext（奇遇「下一步」）不再命中 → CCStart 卡 20s 超时 → 任务报 4000。
-MATCH_SCOPED_HIT_NODES = ("CCNext", "CCEnterBattle")
+# CCSelectPeople4p0 的 max_hit 是**环路限次**（CCFlagInSelectPeople ↔ 本节点每轮都有命中，
+# timeout 永不触发），同样必须按局清零，否则第二局起选领队会直接失败。
+MATCH_SCOPED_HIT_NODES = ("CCNext", "CCEnterBattle", "CCSelectPeople4p0")
 
 
 @dataclass(frozen=True)
@@ -472,7 +480,7 @@ def _parse_sticker(raw: Any, label: str, problems: list[str]) -> StickerSpec | N
     return StickerSpec(open_round=parsed_round, leader=leader, box_point=box_point, positions=tuple(positions))
 
 
-def parse_strategy(raw: Any, *, source: str = str(STRATEGY_PATH)) -> StrategySpec:
+def parse_strategy(raw: Any, *, source: str = STRATEGY_REL_PATH) -> StrategySpec:
     """校验并构建策略表；一次性报出全部问题，便于维护时逐条修。"""
     if not isinstance(raw, dict):
         raise StrategyError(f"{source}: 顶层应为对象")
@@ -591,7 +599,7 @@ EMPTY_STRATEGY = StrategySpec(
 )
 
 
-def load_strategy(path: Path = STRATEGY_PATH) -> StrategySpec:
+def load_strategy(path: Path | None = None) -> StrategySpec:
     """读取并校验策略表；失败直接抛（由调用方决定怎么报错，不静默兜底）。
 
     Raises:
@@ -600,9 +608,10 @@ def load_strategy(path: Path = STRATEGY_PATH) -> StrategySpec:
         UnicodeDecodeError: 不是 UTF-8
         StrategyError: 结构/取值不合法
     """
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    strategy = parse_strategy(raw, source=str(path))
-    logger.debug(f"已加载翻斗棋策略表 {path}（version={strategy.version}）")
+    resolved = path if path is not None else _default_strategy_path()
+    raw = json.loads(resolved.read_text(encoding="utf-8"))
+    strategy = parse_strategy(raw, source=str(resolved))
+    logger.debug(f"已加载翻斗棋策略表 {resolved}（version={strategy.version}）")
     return strategy
 
 
@@ -683,6 +692,24 @@ class CCChessboard(CustomAction):
         领队只在真正开新局时由 reset_leader() 复位。
         """
         cls.rerolls_used = {}
+
+    @classmethod
+    def clear_match_scoped_hits(cls, context: Context) -> None:
+        """把 `max_hit` 是「按局限次」的节点命中计数清零 —— 见 MATCH_SCOPED_HIT_NODES。
+
+        两个调用点，缺一不可：
+          · `CCFlagInCombatMain`（对局页锚点）：每局主循环命中一次，清掉上一局的累计；
+          · `CCPickLeaderRec` 的重摇分支：重摇走「选领队页 → 主菜单 → CCStop → CCStart」，
+            **不经过对局页**，不给这里清的话，`people.max_reroll > 0`（`data/` 里用户可改）
+            时每摇一次 `CCSelectPeople4p0` 就 +1，第 6 次左右该节点就不再被识别 → 选领队页
+            20s 全 miss → 4000。重摇额度本身有上限，所以这里清不会破坏限次语义
+            （真正的死环走的是门 3「已选中」分支，不消耗额度、也不清计数）。
+        """
+        for node_name in MATCH_SCOPED_HIT_NODES:
+            try:
+                context.clear_hit_count(node_name)
+            except Exception as e:  # noqa: BLE001 - 计数复位失败不该拖垮主循环
+                logger.warning(f"清 {node_name} 命中计数失败: {e}")
 
     # 暂时买不动的卡 → 卡名: 剩余跳过次数
     #
@@ -822,7 +849,7 @@ class CCChessboard(CustomAction):
         return True
 
     @classmethod
-    def reload_strategy(cls, path: Path = STRATEGY_PATH) -> StrategySpec:
+    def reload_strategy(cls, path: Path | None = None) -> StrategySpec:
         """按策略表重载棋盘配置；数据文件不可用时沿用内置 4.0 策略。"""
         strategy = load_strategy(path)
         cls.apply_strategy(strategy)
@@ -1197,16 +1224,12 @@ class CCChessboard(CustomAction):
         # 1) 选领队重摇额度清零 —— 额度按每一局算，而不是每个任务（一个任务会连打多局，
         #    实测打完 7 轮会自动开下一局，不复位的话第二局起就只能兜底）。
         #    重摇环走在 选领队/主菜单/奇遇，不会经过这里，所以额度不会被中途刷掉。
-        # 2) 清 MATCH_SCOPED_HIT_NODES 的命中计数 —— 见上面常量注释。
+        # 2) 清 MATCH_SCOPED_HIT_NODES 的命中计数 —— 见 clear_match_scoped_hits。
         # 3) 检测新对局：回合数变小就清空内部棋盘（详见 _last_round 注释）。
         self._reset_if_new_game(context)
 
         type(self).reset_rerolls()
-        for node_name in MATCH_SCOPED_HIT_NODES:
-            try:
-                context.clear_hit_count(node_name)
-            except Exception as e:  # noqa: BLE001 - 计数复位失败不该拖垮主循环
-                logger.warning(f"清 {node_name} 命中计数失败: {e}")
+        type(self).clear_match_scoped_hits(context)
         return CustomAction.RunResult(success=True)
 
 
@@ -1222,39 +1245,54 @@ class CCBuyCard(CustomAction):
     _BUY_SETTLE = 1.2
     # 详情面板里「购买」按钮的位置（实测 940,568；面板居中、布局固定）
     _BUY_BUTTON_POINT = (940, 568)
+    # 关面板用的「面板外空白处」。比 DEFAULT_PANEL_CLOSE_POINT(1150,650) 更靠外：
+    # 那个点挨着商店「刷新」按钮，误点会白烧一次刷新。实测（2026-10-29）点这里面板
+    # 立即关闭、棋盘无任何副作用。
+    _PANEL_BLANK_POINT = (150, 400)
     # 买卡前后「落子格」的最小平均像素差；空位底纹会有轻微抖动，取 6 足够区分
     _PIECE_DIFF_MIN = 6.0
 
-    @staticmethod
-    def _close_card_panel(context: Context) -> None:
-        """关掉卡牌详情面板（ESC 优先，失败回退点击）。
+    @classmethod
+    def _panel_still_open(cls, context: Context) -> bool | None:
+        """复查卡牌详情面板是否还开着（判据 = 面板右下角那颗「免费 / 购买」按钮）。
 
-        Python binding 只有 post_click_key（没有 post_key）；写错会抛 AttributeError
-        被吞掉，然后静默回退到无效的点击 —— 面板关不掉，后续识别全被遮挡。
+        复用 pipeline 的 `CCEntryCardPanel` 节点，不要另写一套参数：两处判据一旦分叉，
+        就会出现「这里说还开着、pipeline 说没开」的对不上。返回 `None` = 复查本身失败
+        （取帧/识别异常），调用方按「不确定」处理。
         """
-        # post_click_key(111) 实测无效：发了 40 次、面板 40 次都还在（13:11 那轮日志）。
-        # 改用 key_down + key_up 的显式按下/抬起（Android 上更接近物理键）。
+        try:
+            img = context.tasker.controller.post_screencap().wait().get()
+            return is_hit(context.run_recognition("CCEntryCardPanel", img))
+        except Exception as e:  # noqa: BLE001 - 复查失败不该中断买卡流程
+            logger.debug(f"复查卡牌面板失败：{e}")
+            return None
+
+    @classmethod
+    def _close_card_panel(cls, context: Context) -> None:
+        """关掉卡牌详情面板：先点面板外的空白处，仍在就补一发 ESC。
+
+        顺序是**点击优先**，不是 ESC 优先 —— PlayCover controller 明确不支持 click_key
+        （`PlayCoverControlUnitMgr.cpp` → `click_key is not supported`），动作失败会把整个
+        任务判死；点击两边都支持，实测（2026-10-29）点面板外空白处面板立即关闭、
+        棋盘无副作用。ESC 只留作 ADB 侧兜底（`post_click_key(111)` 对这一页实测无效，
+        必须用 key_down + key_up）。
+        """
+        context.tasker.controller.post_click(*CCBuyCard._PANEL_BLANK_POINT).wait()
+        time.sleep(0.6)
+        if cls._panel_still_open(context) is not True:
+            return
+
         try:
             context.tasker.controller.post_key_down(111).wait()
             time.sleep(0.05)
             context.tasker.controller.post_key_up(111).wait()
-            logger.debug("已发 ESC(111) 关面板")
+            time.sleep(0.4)
+            logger.debug("点击没关掉面板，补发 ESC(111)")
         except Exception as e:  # noqa: BLE001 - 关面板失败不该中断买卡流程
-            logger.warning(f"发 ESC 关面板失败（{e}），改用点击兜底")
-            context.tasker.controller.post_click(*DEFAULT_PANEL_CLOSE_POINT).wait()
-        time.sleep(0.6)
-        # 关完复查：面板还在就说明 ESC 没生效，记录下来便于定位
-        try:
-            img = context.tasker.controller.post_screencap().wait().get()
-            still = context.run_recognition(
-                "CCPanelArrowRec",
-                img,
-                {"CCPanelArrowRec": {"template": "CritterCrash/PanelArrow.png", "roi": [980, 250, 120, 100]}},
-            )
-            if is_hit(still):
-                logger.warning("ESC 后卡牌详情面板仍在（PanelArrow 仍命中）")
-        except Exception:  # noqa: BLE001 - 复查失败不影响主流程
-            pass
+            logger.debug(f"补发 ESC 失败（{e}）")
+
+        if cls._panel_still_open(context) is True:
+            logger.warning("卡牌详情面板仍开着（点击 + ESC 都没关掉），后续识别会被遮挡")
 
     @classmethod
     def _pick_target_cell(
@@ -1367,10 +1405,9 @@ class CCBuyCard(CustomAction):
         argv: CustomAction.RunArg,
     ) -> CustomAction.RunResult:
         # 策略已经在reco中制定，直接从argv.reco_detail获取结果
-        detail_str = argv.reco_detail.raw_detail["best"]["detail"]
+        detail_data = custom_result_dict(argv.reco_detail)
         box = argv.box
 
-        detail_data = self._parse_detail(detail_str)
         if not detail_data:
             logger.debug("无法解析detail")
             return CustomAction.RunResult(success=False)
@@ -1587,18 +1624,6 @@ class CCBuyCard(CustomAction):
             logger.debug(f"未知action: {action}")
             return CustomAction.RunResult(success=False)
 
-    def _parse_detail(self, detail: Any) -> dict[str, Any] | None:
-        """从detail中解析type和action"""
-        try:
-            # 如果是dict，直接使用
-            if isinstance(detail, dict):
-                return detail
-            # 如果是其他，尝试json.loads
-            return json.loads(str(detail))
-        except Exception as e:
-            logger.debug(f"解析detail失败: {e}")
-            return None
-
 
 @AgentServer.custom_action("CCLevelUp")
 class CCLevelUp(CustomAction):
@@ -1659,7 +1684,8 @@ class CCResetData(CustomAction):
         except ValueError as e:
             logger.warning(f"CCResetData 参数非法（{e}），使用默认策略表")
 
-        path = Path(strategy_file) if strategy_file else STRATEGY_PATH
+        # strategy_file 是 pipeline 参数给的相对路径，同样走覆盖层解析
+        path = get_runtime_paths().resolve(strategy_file if strategy_file else STRATEGY_REL_PATH)
         try:
             CCChessboard.reload_strategy(path)
         except (OSError, ValueError) as e:
@@ -1841,8 +1867,7 @@ class CCSticker(CustomAction):
             return CustomAction.RunResult(success=True)
 
         # 面板可能没点中：关掉它，贴纸留给下一轮
-        context.tasker.controller.post_click(*DEFAULT_PANEL_CLOSE_POINT).wait()
-        time.sleep(0.4)
+        CCBuyCard._close_card_panel(context)
         logger.debug("贴纸点击后仍在奖励区，关闭面板，下一轮再试")
         return CustomAction.RunResult(success=True)
 

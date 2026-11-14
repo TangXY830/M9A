@@ -3,15 +3,23 @@ import difflib
 import json
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 from maa.agent.agent_server import AgentServer
 from maa.context import Context
 from maa.custom_action import CustomAction
-from utils import logger
-from utils.maa_types import is_hit, ocr_text
+from utils.logger import logger
+from utils.maa_types import custom_result_dict, filtered_result_dicts, is_hit, ocr_text
 from utils.params import parse_params
+from utils.runtime_paths import get_runtime_paths
+
+
+def _sos_data_path(name: str) -> Path:
+    """data/sos 数据文件按覆盖层解析：数据目录的热更文件优先，包内基线兜底。"""
+    return get_runtime_paths().resolve(f"data/sos/{name}")
+
 
 __all__ = [
     "SOSSelectNode",
@@ -24,6 +32,23 @@ __all__ = [
     "SOSSelectInstrument",
     "SOSSwitchStat",
 ]
+
+
+def _detail_options(detail: Any) -> list[dict[str, Any]]:
+    """读取自定义识别 detail 中的 options 列表，结构不符时返回空列表。"""
+    payload = custom_result_dict(detail)
+    options = payload.get("options") if payload else None
+    if not isinstance(options, list):
+        return []
+    return [option for option in options if isinstance(option, dict)]
+
+
+def _roi_from_option(option: dict[str, Any]) -> list[int] | None:
+    """把选项里的 roi 转成 [x, y, w, h]，缺失或非法时返回 None。"""
+    roi = option.get("roi")
+    if not isinstance(roi, list) or len(roi) != 4 or not all(isinstance(value, int) for value in roi):
+        return None
+    return roi
 
 
 @AgentServer.custom_action("SOSSelectNode")
@@ -50,10 +75,10 @@ class SOSSelectNode(CustomAction):
         except Exception:
             pass
 
-        reco_detail = argv.reco_detail.raw_detail["best"]["detail"]
+        reco_detail = custom_result_dict(argv.reco_detail)
 
         try:
-            with open("data/sos/nodes.json", encoding="utf-8") as f:
+            with open(_sos_data_path("nodes.json"), encoding="utf-8") as f:
                 nodes = json.load(f)
         except FileNotFoundError:
             print("错误：文件 data/sos/nodes.json 未找到。")
@@ -69,7 +94,7 @@ class SOSSelectNode(CustomAction):
             return CustomAction.RunResult(success=False)
 
         # 模板匹配后端的 detail 结构：{"all": [...], "filtered": [...], "best": {...}}
-        best = reco_detail.get("best") if isinstance(reco_detail, dict) else None
+        best = reco_detail.get("best") if reco_detail else None
         cls_index = best.get("cls_index") if best else None
         box = best.get("box") if best else None
 
@@ -81,7 +106,12 @@ class SOSSelectNode(CustomAction):
             logger.error("box 为 None")
             return CustomAction.RunResult(success=False)
 
-        node_type = nodes["types"][cls_index]
+        node_types = nodes["types"]
+        if not isinstance(cls_index, int) or not 0 <= cls_index < len(node_types):
+            logger.error(f"cls_index 越界: {cls_index}")
+            return CustomAction.RunResult(success=False)
+
+        node_type = node_types[cls_index]
         if not node_type:
             logger.error(f"空的 node_type for cls_index: {cls_index}")
             return CustomAction.RunResult(success=False)
@@ -302,7 +332,7 @@ class SOSNodeProcess(CustomAction):
             logger.debug("刚完成恶战重开，跳过本次节点处理")
             return CustomAction.RunResult(success=True)
 
-        with open("data/sos/nodes.json", encoding="utf-8") as f:
+        with open(_sos_data_path("nodes.json"), encoding="utf-8") as f:
             nodes = json.load(f)
 
         node_type, event_name = (
@@ -630,11 +660,15 @@ class SOSSelectEncounterOption_OCR(CustomAction):
     ) -> CustomAction.RunResult:
 
         expected: str = parse_params(argv.custom_action_param, "expected")["expected"]
-        options: list[dict[str, Any]] = argv.reco_detail.raw_detail["best"]["detail"]["options"]
+        options = _detail_options(argv.reco_detail)
 
         for option in options:
-            if expected in option["content"]:
-                x, y, w, h = option["roi"]
+            content = option.get("content")
+            roi = _roi_from_option(option)
+            if not isinstance(content, str) or roi is None:
+                continue
+            if expected in content:
+                x, y, w, h = roi
                 context.run_task(
                     "Click",
                     {
@@ -662,15 +696,24 @@ class SOSSelectEncounterOption_HSV(CustomAction):
         argv: CustomAction.RunArg,
     ) -> CustomAction.RunResult:
 
-        index: int = parse_params(argv.custom_action_param).get("index", 0)
-        options: list[dict[str, Any]] = argv.reco_detail.raw_detail["best"]["detail"]["options"]
+        index_param = parse_params(argv.custom_action_param).get("index", 0)
+        index = index_param if isinstance(index_param, int) else -1
+        options = _detail_options(argv.reco_detail)
+        if not 0 <= index < len(options):
+            logger.error(f"偶遇选项 index 越界: {index_param!r} / {len(options)}")
+            return CustomAction.RunResult(success=False)
+
+        roi = _roi_from_option(options[index])
+        if roi is None:
+            logger.error(f"偶遇选项 {index} 缺少合法 roi")
+            return CustomAction.RunResult(success=False)
 
         context.run_task(
             "Click",
             {
                 "Click": {
                     "action": "Click",
-                    "target": options[index]["roi"],
+                    "target": roi,
                     "pre_delay": 0,
                     "post_delay": 1500,
                 }
@@ -696,7 +739,7 @@ class SOSShoppingList(CustomAction):
         SOSShoppingList.shopping_items = {}
 
         # 加载物品数据用于纠错
-        with open("data/sos/items.json", encoding="utf-8") as f:
+        with open(_sos_data_path("items.json"), encoding="utf-8") as f:
             items_data = json.load(f)
 
         # 构建所有有效物品名的集合（造物+谐波）
@@ -727,8 +770,7 @@ class SOSShoppingList(CustomAction):
                 continue
 
             # 获取识别结果列表（已按垂直顺序排列）
-            raw_detail = reco_detail.raw_detail
-            current_results = raw_detail.get("filtered", []) if raw_detail else []
+            current_results = filtered_result_dicts(reco_detail)
 
             # 配对物品名和价格（传入原始图像和context用于检测已售出标记）
             items, skipped = self._pair_items_and_prices(current_results, img, context)
@@ -949,7 +991,7 @@ class SOSBuyItems(CustomAction):
 
         # 加载物品优先级配置（可选）
         try:
-            with open("data/sos/items.json", encoding="utf-8") as f:
+            with open(_sos_data_path("items.json"), encoding="utf-8") as f:
                 _items_data = json.load(f)
             # 可以在这里定义优先级逻辑，暂时按价格升序排列（买便宜的，数量更多）
         except Exception:
@@ -998,8 +1040,7 @@ class SOSBuyItems(CustomAction):
                 )
                 continue
 
-            raw_detail = reco_detail.raw_detail
-            current_results = raw_detail.get("filtered", []) if raw_detail else []
+            current_results = filtered_result_dicts(reco_detail)
 
             # 获取当前屏幕的物品文本集合
             current_screen_texts = {
@@ -1025,8 +1066,7 @@ class SOSBuyItems(CustomAction):
             # 获取可见价格的物品名集合（金雀子儿足够的物品）
             affordable_items = set()
             if is_hit(price_reco_detail):
-                price_raw_detail = price_reco_detail.raw_detail
-                price_results = price_raw_detail.get("filtered", []) if price_raw_detail else []
+                price_results = filtered_result_dicts(price_reco_detail)
 
                 # 配对物品名和价格，只有能配对成功的说明价格可见
                 i = 0
